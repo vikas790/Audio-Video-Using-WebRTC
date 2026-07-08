@@ -44,6 +44,7 @@ class CallCubit extends BaseCubit<CallUiState> {
   final Set<String> _handledIceIds = {};
   bool _answerHandled = false;
   bool _connected = false;
+  bool _callTerminated = false; // true after hang-up or terminal end — blocks reconnect
   final List<SignallingMessageModel> _pendingIce = [];
   StreamSubscription<CallDocumentModel?>? _callSub;
   StreamSubscription<SignallingMessageModel>? _iceSub;
@@ -101,9 +102,9 @@ class CallCubit extends BaseCubit<CallUiState> {
               RTCPeerConnectionState.RTCPeerConnectionStateDisconnected ||
           connectionState ==
               RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
-        // Wait 30s before disconnect — auto-resume if network returns
-        if (_connected) {
-          _enterReconnecting();
+        // Only reconnect on network loss — not when peer hung up
+        if (_connected && !_callTerminated) {
+          unawaited(_enterReconnecting());
         }
       }
     };
@@ -175,9 +176,52 @@ class CallCubit extends BaseCubit<CallUiState> {
     });
   }
 
-  // Start 30s grace window + ICE recovery when network drops mid-call
-  void _enterReconnecting() {
-    if (!_connected || state.isReconnecting) return;
+  // Stop reconnect timers and hide banner
+  void _cancelReconnect() {
+    _reconnectTimer?.cancel();
+    _iceRecoveryTimer?.cancel();
+    if (state.isReconnecting) {
+      emit(state.copyWith(isReconnecting: false));
+    }
+  }
+
+  // Peer hung up or call ended remotely — end immediately, no reconnect
+  Future<void> _handleRemoteCallEnd(String firestoreStatus) async {
+    if (_callTerminated) return;
+    _callTerminated = true;
+    _connected = false;
+    _cancelReconnect();
+    _ringTimeout?.cancel();
+    _offlineCheckTimer?.cancel();
+
+    if (firestoreStatus == 'declined') {
+      _emitCallState(CallStatus.declined, 'Call declined');
+    } else {
+      _emitCallState(CallStatus.ended, 'Call ended');
+    }
+    await _cleanup();
+  }
+
+  // 30s grace window + ICE recovery — only when network drops, not on hang-up
+  Future<void> _enterReconnecting() async {
+    if (!_connected || state.isReconnecting || _callTerminated) return;
+
+    // Peer may have ended call — check Firestore before showing reconnect banner
+    final callId = _callId;
+    if (callId != null) {
+      try {
+        final doc = await _signallingRepo.getCall(callId);
+        if (doc != null &&
+            (doc.status == 'ended' || doc.status == 'declined')) {
+          await _handleRemoteCallEnd(doc.status);
+          return;
+        }
+      } catch (_) {
+        // Firestore unreachable — treat as network loss and try reconnect
+      }
+    }
+
+    if (_callTerminated || !_connected) return;
 
     emit(state.copyWith(
       isReconnecting: true,
@@ -188,7 +232,7 @@ class CallCubit extends BaseCubit<CallUiState> {
     _reconnectTimer = Timer(
       const Duration(seconds: AppConstants.callReconnectGraceSeconds),
       () {
-        if (state.isReconnecting) {
+        if (state.isReconnecting && !_callTerminated) {
           _failConnection('Connection lost');
         }
       },
@@ -218,21 +262,29 @@ class CallCubit extends BaseCubit<CallUiState> {
     }
   }
 
-  // Network restored within grace period — resume call UI
+  // Network restored within 30s — resume call UI and timer
   void _onReconnected() {
     _reconnectTimer?.cancel();
     _iceRecoveryTimer?.cancel();
+    if (_callId != null) {
+      _signallingRepo.updateCallStatus(_callId!, 'connected');
+    }
     emit(state.copyWith(
       isReconnecting: false,
       statusMessage: 'Connected',
       call: state.call?.copyWith(status: CallStatus.connected),
     ));
+    // Resume duration if timer was stopped during disconnect
+    if (_durationTimer == null || !(_durationTimer?.isActive ?? false)) {
+      _startDurationTimer();
+    }
   }
 
   void _failConnection(String message) {
-    _reconnectTimer?.cancel();
-    _iceRecoveryTimer?.cancel();
-    emit(state.copyWith(isReconnecting: false));
+    if (_callTerminated) return;
+    _callTerminated = true;
+    _connected = false;
+    _cancelReconnect();
     _emitFailed(message);
     _finalizeCall('ended');
   }
@@ -262,14 +314,12 @@ class CallCubit extends BaseCubit<CallUiState> {
       if (doc == null) return;
 
       if (doc.status == 'declined') {
-        _ringTimeout?.cancel();
-        _offlineCheckTimer?.cancel();
-        _emitCallState(CallStatus.declined, 'Call declined');
+        unawaited(_handleRemoteCallEnd('declined'));
         return;
       }
 
       if (doc.status == 'ended') {
-        _emitCallState(CallStatus.ended, 'Call ended');
+        unawaited(_handleRemoteCallEnd('ended'));
         return;
       }
 
@@ -359,6 +409,9 @@ class CallCubit extends BaseCubit<CallUiState> {
   }
 
   Future<void> declineCall() async {
+    _callTerminated = true;
+    _connected = false;
+    _cancelReconnect();
     if (_callId != null) {
       await _signallingRepo.updateCallStatus(_callId!, 'declined');
     }
@@ -367,7 +420,11 @@ class CallCubit extends BaseCubit<CallUiState> {
   }
 
   Future<void> endCall() async {
-    // Emit ended only for normal hang-up — keep failed/declined text
+    // Mark terminated first so WebRTC disconnect won't trigger reconnect
+    _callTerminated = true;
+    _connected = false;
+    _cancelReconnect();
+
     if (state.call?.status != CallStatus.failed &&
         state.call?.status != CallStatus.declined) {
       _emitCallState(CallStatus.ended, 'Call ended');
@@ -377,10 +434,11 @@ class CallCubit extends BaseCubit<CallUiState> {
 
   // Update Firestore + cleanup without changing visible failed/declined text
   Future<void> _finalizeCall(String firestoreStatus) async {
+    _callTerminated = true;
+    _connected = false;
+    _cancelReconnect();
     _ringTimeout?.cancel();
     _offlineCheckTimer?.cancel();
-    _reconnectTimer?.cancel();
-    _iceRecoveryTimer?.cancel();
     if (_callId != null) {
       try {
         await _signallingRepo.updateCallStatus(_callId!, firestoreStatus);
@@ -392,6 +450,9 @@ class CallCubit extends BaseCubit<CallUiState> {
   }
 
   Future<void> _cleanup() async {
+    _callTerminated = true;
+    _connected = false;
+    _cancelReconnect();
     _ringTimeout?.cancel();
     _offlineCheckTimer?.cancel();
     _reconnectTimer?.cancel();

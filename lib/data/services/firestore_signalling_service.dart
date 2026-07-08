@@ -63,6 +63,13 @@ class FirestoreSignallingService {
     await _calls.doc(callId).update({'status': status});
   }
 
+  // One-shot read — used to detect remote hang-up before showing reconnect UI
+  Future<CallDocumentModel?> getCall(String callId) async {
+    final snap = await _calls.doc(callId).get();
+    if (!snap.exists || snap.data() == null) return null;
+    return CallDocumentModel.fromFirestore(snap.id, snap.data()!);
+  }
+
   Stream<CallDocumentModel?> watchCall(String callId) {
     return _calls.doc(callId).snapshots().map((snap) {
       if (!snap.exists || snap.data() == null) return null;

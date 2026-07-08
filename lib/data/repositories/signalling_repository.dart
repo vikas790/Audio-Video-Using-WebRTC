@@ -53,4 +53,6 @@ class SignallingRepository extends BaseRepository {
 
   Future<void> updateCallStatus(String callId, String status) =>
       _service.updateCallStatus(callId, status);
+
+  Future<CallDocumentModel?> getCall(String callId) => _service.getCall(callId);
 }

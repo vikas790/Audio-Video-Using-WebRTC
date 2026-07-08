@@ -5,9 +5,12 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../../../../data/models/call_state_model.dart';
 import '../../../../data/models/user_model.dart';
 import '../../../../utils/constant.dart';
+import '../../../../utils/local_storage.dart';
 import '../../core/widgets/default_caller_avatar.dart';
 import 'state/call_state.dart';
+import 'state/chat_state.dart';
 import 'view_model/call_cubit.dart';
+import 'view_model/chat_cubit.dart';
 
 // Map call lifecycle to visible UI label
 String callStatusLabel(CallUiState state) {
@@ -62,14 +65,20 @@ class CallScreen extends StatefulWidget {
 class _CallScreenState extends State<CallScreen> {
   @override
   Widget build(BuildContext context) {
-    return BlocProvider(
-      create: (_) => CallCubit(
-        peer: widget.peer,
-        isOutgoing: widget.isOutgoing,
-        isVideoCall: widget.isVideoCall,
-        existingCallId: widget.existingCallId,
-        existingOffer: widget.existingOffer,
-      )..start(),
+    return MultiBlocProvider(
+      providers: [
+        BlocProvider(
+          create: (_) => CallCubit(
+            peer: widget.peer,
+            isOutgoing: widget.isOutgoing,
+            isVideoCall: widget.isVideoCall,
+            existingCallId: widget.existingCallId,
+            existingOffer: widget.existingOffer,
+          )..start(),
+        ),
+        // Separate cubit for in-call chat — keeps call logic untouched
+        BlocProvider(create: (_) => ChatCubit()),
+      ],
       child: _CallView(isVideoCall: widget.isVideoCall),
     );
   }
@@ -145,6 +154,20 @@ class _CallViewState extends State<_CallView> {
     return '$m:$s';
   }
 
+  // Open chat as a bottom sheet, reusing the existing ChatCubit instance
+  void _openChat(BuildContext context) {
+    final chatCubit = context.read<ChatCubit>();
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => BlocProvider.value(
+        value: chatCubit,
+        child: const _ChatPanel(),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return BlocListener<CallCubit, CallUiState>(
@@ -165,6 +188,11 @@ class _CallViewState extends State<_CallView> {
         listener: (context, state) {
           if (widget.isVideoCall) {
             _bindStreams(context.read<CallCubit>());
+          }
+          // Attach chat once signalling assigns the call id (guards duplicates)
+          final callId = state.call?.callId;
+          if (callId != null && callId.isNotEmpty) {
+            context.read<ChatCubit>().attachCall(callId);
           }
         },
         child: Scaffold(
@@ -207,6 +235,15 @@ class _CallViewState extends State<_CallView> {
                       left: 0,
                       right: 0,
                       child: _ReconnectBanner(),
+                    ),
+                  // Chat only when call is fully connected — hide during ringing/reconnecting/ended
+                  if (state.call?.status == CallStatus.connected)
+                    Positioned(
+                      left: 12,
+                      bottom: 96,
+                      child: _ChatButton(
+                        onTap: () => _openChat(context),
+                      ),
                     ),
                 ],
               );
@@ -287,14 +324,14 @@ Color _statusColor(CallStatus? status) {
   }
 }
 
-// Orange banner shown during mid-call network drop
+// Red banner shown during mid-call network drop
 class _ReconnectBanner extends StatelessWidget {
   const _ReconnectBanner();
 
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: const Color(0xFFE67E22),
+      color: const Color(0xFFE84C3D),
       elevation: 4,
       child: SafeArea(
         bottom: false,
@@ -537,6 +574,222 @@ class _CallControls extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+// Left-side floating chat button — solid primary color (matches join buttons)
+class _ChatButton extends StatelessWidget {
+  const _ChatButton({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    // Same blue/primary as pre-join "Join call" button
+    final chatColor = Theme.of(context).colorScheme.primary;
+
+    return BlocBuilder<ChatCubit, ChatState>(
+      builder: (context, state) {
+        final hasMessages = state.messages.isNotEmpty;
+        return Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Material(
+              elevation: 4,
+              shadowColor: Colors.black54,
+              shape: const CircleBorder(),
+              color: chatColor,
+              child: InkWell(
+                onTap: onTap,
+                customBorder: const CircleBorder(),
+                child: const SizedBox(
+                  width: 40,
+                  height: 40,
+                  child: Icon(
+                    Icons.chat_bubble_outline,
+                    color: Colors.white,
+                    size: 20,
+                  ),
+                ),
+              ),
+            ),
+            // Small dot hints that messages exist
+            if (hasMessages)
+              Positioned(
+                right: -1,
+                top: -1,
+                child: Container(
+                  width: 12,
+                  height: 12,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF2ECC71),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white, width: 1.5),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+// In-call chat panel shown as a bottom sheet
+class _ChatPanel extends StatefulWidget {
+  const _ChatPanel();
+
+  @override
+  State<_ChatPanel> createState() => _ChatPanelState();
+}
+
+class _ChatPanelState extends State<_ChatPanel> {
+  final TextEditingController _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _send() {
+    final text = _controller.text;
+    if (text.trim().isEmpty) return;
+    context.read<ChatCubit>().sendMessage(text);
+    _controller.clear();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final myId = LocalStorage.deviceId;
+    // Lift the sheet above the keyboard
+    return Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: Container(
+        height: MediaQuery.of(context).size.height * 0.6,
+        decoration: const BoxDecoration(
+          color: Color(AppConstants.appBackgroundValue),
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        child: Column(
+          children: [
+            // Header
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
+              child: Row(
+                children: [
+                  const Text(
+                    'Chat',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFF2B2B2B),
+                    ),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            // Message list
+            Expanded(
+              child: BlocBuilder<ChatCubit, ChatState>(
+                builder: (context, state) {
+                  final messages = state.messages;
+                  if (messages.isEmpty) {
+                    return const Center(
+                      child: Text(
+                        'No messages yet',
+                        style: TextStyle(color: Color(0xFF8A8A8A)),
+                      ),
+                    );
+                  }
+                  return ListView.builder(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: messages.length,
+                    itemBuilder: (context, index) {
+                      final message = messages[index];
+                      final isMine = message.senderId == myId;
+                      return _ChatBubble(text: message.text, isMine: isMine);
+                    },
+                  );
+                },
+              ),
+            ),
+            // Input row
+            SafeArea(
+              top: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _controller,
+                        textInputAction: TextInputAction.send,
+                        onSubmitted: (_) => _send(),
+                        decoration: InputDecoration(
+                          hintText: 'Type a message…',
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 10,
+                          ),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(24),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton(
+                      onPressed: _send,
+                      icon: const Icon(Icons.send, color: Color(0xFF2B2B2B)),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// Single chat message bubble — right for me, left for peer
+class _ChatBubble extends StatelessWidget {
+  const _ChatBubble({required this.text, required this.isMine});
+
+  final String text;
+  final bool isMine;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.7,
+        ),
+        decoration: BoxDecoration(
+          color: isMine ? const Color(0xFF2ECC71) : const Color(0xFFECECEC),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Text(
+          text,
+          style: TextStyle(
+            color: isMine ? Colors.white : const Color(0xFF2B2B2B),
+            fontSize: 15,
+          ),
+        ),
+      ),
     );
   }
 }
