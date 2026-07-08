@@ -1,0 +1,25 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /Audio Video Call/{userId} {
+      allow read: if true;
+      allow create, update: if request.resource.data.deviceId == userId
+        && request.resource.data.keys().hasAll(['name', 'deviceId', 'isOnline', 'lastSeen']);
+      allow delete: if false;
+    }
+
+    match /calls/{callId} {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasAll(
+        ['callerId', 'calleeId', 'status', 'offer', 'createdAt']
+      );
+      allow update: if true;
+      allow delete: if false;
+
+      match /ice/{iceId} {
+        allow read, create: if true;
+        allow update, delete: if false;
+      }
+    }
+  }
+}

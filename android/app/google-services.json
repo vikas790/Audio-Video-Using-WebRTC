@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "792804510625",
+    "project_id": "audio-video-demo-b8fb4",
+    "storage_bucket": "audio-video-demo-b8fb4.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:792804510625:android:da5340c8cef8f0de46d9e0",
+        "android_client_info": {
+          "package_name": "com.example.audiovideo_task"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC-ZClIPX0yEjf25hWlTx6SqnRDS8IxEnE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
