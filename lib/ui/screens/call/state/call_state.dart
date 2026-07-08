@@ -13,6 +13,7 @@ class CallUiState extends ApiRenderState {
     this.durationSeconds = 0,
     this.statusMessage,
     this.isReconnecting = false,
+    this.isPeerReconnecting = false,
   });
 
   final CallStateModel? call;
@@ -23,7 +24,8 @@ class CallUiState extends ApiRenderState {
   final bool hasRemoteVideo;
   final int durationSeconds;
   final String? statusMessage;
-  final bool isReconnecting;
+  final bool isReconnecting; // local network lost — show red banner
+  final bool isPeerReconnecting; // peer lost network — text only, no banner
 
   CallUiState copyWith({
     CallStateModel? call,
@@ -35,6 +37,7 @@ class CallUiState extends ApiRenderState {
     int? durationSeconds,
     String? statusMessage,
     bool? isReconnecting,
+    bool? isPeerReconnecting,
   }) {
     return CallUiState(
       call: call ?? this.call,
@@ -47,6 +50,7 @@ class CallUiState extends ApiRenderState {
       // Keep last status text when other fields update (e.g. timer tick)
       statusMessage: statusMessage ?? this.statusMessage,
       isReconnecting: isReconnecting ?? this.isReconnecting,
+      isPeerReconnecting: isPeerReconnecting ?? this.isPeerReconnecting,
     );
   }
 }

@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../../../../config/locator.dart';
@@ -52,10 +54,49 @@ class CallCubit extends BaseCubit<CallUiState> {
   Timer? _ringTimeout;
   Timer? _reconnectTimer;
   Timer? _iceRecoveryTimer;
+  Timer? _peerWaitTimer; // user with network waits for peer to return
+  Timer? _networkPollTimer; // polls for local network during reconnect
+  Timer? _reconnectRetryTimer; // retries SDP renegotiation while reconnecting
   Timer? _offlineCheckTimer;
+  Timer? _disconnectDebounceTimer;
+
+  bool _waitingForPeer = false; // peer lost network, we still have it
+  bool _reconnectOfferSent = false;
+  bool _reconnectAttemptInFlight = false;
+  DateTime? _lastReconnectOfferAt;
+  String? _lastHandledReconnectOfferSdp;
+  DateTime? _lastHandledReconnectOfferAt;
+  String? _lastAppliedReconnectAnswerSdp;
+  DateTime? _ignoreDisconnectUntil;
+  RTCPeerConnectionState? _lastConnectionState;
 
   String? _callId;
   String get _localUserId => LocalStorage.deviceId;
+
+  void _log(String message) {
+    debugPrint('[CallCubit][$_localUserId] $message');
+  }
+
+  bool _inReconnectStabilizationWindow() {
+    final until = _ignoreDisconnectUntil;
+    return until != null && DateTime.now().isBefore(until);
+  }
+
+  void _scheduleDebouncedConnectionLoss() {
+    if (_disconnectDebounceTimer?.isActive ?? false) return;
+    _log('DISCONNECTED detected, waiting debounce');
+    _disconnectDebounceTimer = Timer(const Duration(seconds: 3), () async {
+      _disconnectDebounceTimer = null;
+      if (_callTerminated || !_connected) return;
+      if (_lastConnectionState ==
+          RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        _log('Debounce resolved: recovered to connected');
+        return;
+      }
+      _log('Debounce resolved: still disconnected');
+      await _handleConnectionLoss();
+    });
+  }
 
   Future<void> start() async {
     _setupWebRtcCallbacks();
@@ -91,20 +132,43 @@ class CallCubit extends BaseCubit<CallUiState> {
     };
 
     _webrtc.onConnectionStateChange = (connectionState) {
+      _lastConnectionState = connectionState;
+      _log('WebRTC state -> $connectionState');
       if (connectionState ==
           RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        _disconnectDebounceTimer?.cancel();
         if (state.isReconnecting) {
           _onReconnected();
+        } else if (_waitingForPeer) {
+          _onPeerCameBack();
         } else {
           _onConnected();
         }
       } else if (connectionState ==
-              RTCPeerConnectionState.RTCPeerConnectionStateDisconnected ||
-          connectionState ==
-              RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
-        // Only reconnect on network loss — not when peer hung up
+          RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+        if (_inReconnectStabilizationWindow()) {
+          _log('Ignoring transient disconnect in stabilization window');
+          return;
+        }
+        // Only handle loss mid-call — not after hang-up
         if (_connected && !_callTerminated) {
-          unawaited(_enterReconnecting());
+          _scheduleDebouncedConnectionLoss();
+        }
+      } else if (connectionState ==
+              RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+          connectionState ==
+              RTCPeerConnectionState.RTCPeerConnectionStateClosed) {
+        if (_inReconnectStabilizationWindow()) {
+          _log('Ignoring transient failed/closed in stabilization window');
+          return;
+        }
+        // During peer-wait, re-check local network before showing red banner.
+        if (_waitingForPeer && !_callTerminated) {
+          unawaited(_handleFailureWhileWaitingForPeer());
+          return;
+        }
+        if (_connected && !_callTerminated) {
+          unawaited(_handleConnectionLoss());
         }
       }
     };
@@ -176,12 +240,328 @@ class CallCubit extends BaseCubit<CallUiState> {
     });
   }
 
-  // Stop reconnect timers and hide banner
+  // Stop reconnect / wait timers and hide banner
   void _cancelReconnect() {
+    _disconnectDebounceTimer?.cancel();
     _reconnectTimer?.cancel();
     _iceRecoveryTimer?.cancel();
-    if (state.isReconnecting) {
-      emit(state.copyWith(isReconnecting: false));
+    _peerWaitTimer?.cancel();
+    _networkPollTimer?.cancel();
+    _reconnectRetryTimer?.cancel();
+    _waitingForPeer = false;
+    _reconnectAttemptInFlight = false;
+    if (state.isReconnecting || state.isPeerReconnecting) {
+      emit(state.copyWith(
+        isReconnecting: false,
+        isPeerReconnecting: false,
+      ));
+    }
+  }
+
+  void _resetReconnectNegotiation() {
+    _reconnectOfferSent = false;
+    _reconnectAttemptInFlight = false;
+    _lastReconnectOfferAt = null;
+    _lastHandledReconnectOfferSdp = null;
+    _lastHandledReconnectOfferAt = null;
+    _lastAppliedReconnectAnswerSdp = null;
+    _handledIceIds.clear();
+  }
+
+  void _clearReconnectSession() {
+    _resetReconnectNegotiation();
+    _networkPollTimer?.cancel();
+    final callId = _callId;
+    if (callId != null) {
+      _signallingRepo.markCallConnected(callId);
+    }
+  }
+
+  // True when this device has active internet connectivity.
+  Future<bool> _hasLocalNetwork() async {
+    // Use internet probe only for reconnect-side decision. Backend checks can
+    // fail transiently and incorrectly put both users into local reconnect.
+    try {
+      final result = await InternetAddress.lookup(
+        'google.com',
+      ).timeout(const Duration(seconds: 3));
+      if (result.isEmpty || result.first.rawAddress.isEmpty) {
+        return false;
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Confirm local outage with retries to avoid false banner on peer side.
+  Future<bool?> _detectLocalNetworkDown() async {
+    var failedChecks = 0;
+    const totalChecks = 2;
+    for (var i = 0; i < totalChecks; i++) {
+      final hasNetwork = await _hasLocalNetwork();
+      if (!hasNetwork) failedChecks++;
+      // Small gap helps avoid transient DNS/probe race.
+      if (i < totalChecks - 1) {
+        await Future<void>.delayed(const Duration(milliseconds: 350));
+      }
+    }
+    if (failedChecks == 0) return false;
+    if (failedChecks == totalChecks) return true;
+    // Mixed result -> uncertain state; avoid showing local red banner.
+    return null;
+  }
+
+  // WebRTC dropped — route to local reconnect vs silent peer-wait
+  Future<void> _handleConnectionLoss() async {
+    if (!_connected ||
+        _callTerminated ||
+        state.isReconnecting ||
+        _waitingForPeer) {
+      return;
+    }
+
+    // Peer may have hung up — end immediately if Firestore says so
+    final callId = _callId;
+    if (callId != null) {
+      try {
+        final doc = await _signallingRepo.getCall(callId);
+        if (doc != null &&
+            (doc.status == 'ended' || doc.status == 'declined')) {
+          await _handleRemoteCallEnd(doc.status);
+          return;
+        }
+      } catch (_) {
+        // Firestore unreachable — local network likely down
+      }
+    }
+
+    if (_callTerminated || !_connected) return;
+
+    final localNetworkDown = await _detectLocalNetworkDown();
+    _log('Connection lost detected, localNetworkDown=$localNetworkDown');
+    if (localNetworkDown == true) {
+      // We lost network — show reconnect banner only on this device.
+      _enterLocalReconnecting();
+      return;
+    }
+    // Local network is up/uncertain — treat as peer reconnect (no red banner).
+    _enterWaitingForPeer();
+  }
+
+  // Decide reconnect side again when peer-wait gets failed/closed state.
+  Future<void> _handleFailureWhileWaitingForPeer() async {
+    if (!_waitingForPeer || _callTerminated) return;
+    final localNetworkDown = await _detectLocalNetworkDown();
+    _log('Peer-wait failed/closed, localNetworkDown=$localNetworkDown');
+    if (_callTerminated || !_waitingForPeer) return;
+    if (localNetworkDown == true) {
+      _waitingForPeer = false;
+      _peerWaitTimer?.cancel();
+      _enterLocalReconnecting();
+      return;
+    }
+    // Keep waiting for peer if local network is up/uncertain.
+    _startIceRecovery();
+  }
+
+  // Peer lost network — text only "Reconnecting…", no red banner
+  void _enterWaitingForPeer() {
+    if (_waitingForPeer || state.isReconnecting || _callTerminated) return;
+    _waitingForPeer = true;
+    _resetReconnectNegotiation();
+    _log('Entered peer reconnect wait state');
+
+    emit(state.copyWith(
+      statusMessage: 'Reconnecting…',
+      isPeerReconnecting: true,
+    ));
+
+    _peerWaitTimer?.cancel();
+    _peerWaitTimer = Timer(
+      const Duration(seconds: AppConstants.callReconnectGraceSeconds),
+      () {
+        if (_waitingForPeer && !_callTerminated) {
+          // Strict grace limit: call must recover within configured timeout.
+          _failConnection('Connection lost');
+        }
+      },
+    );
+
+    _startIceRecovery();
+  }
+
+  // Local network lost — red banner + poll until data returns
+  void _enterLocalReconnecting() {
+    if (state.isReconnecting || _callTerminated) return;
+    _resetReconnectNegotiation();
+    _log('Entered local reconnect state (show red banner)');
+
+    emit(state.copyWith(
+      isReconnecting: true,
+      isPeerReconnecting: false,
+      statusMessage: 'Reconnecting…',
+    ));
+
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(
+      const Duration(seconds: AppConstants.callReconnectGraceSeconds),
+      () {
+        if (state.isReconnecting && !_callTerminated) {
+          // Strict grace limit: call must recover within configured timeout.
+          _log('Reconnect grace timeout hit -> failing call');
+          _failConnection('Connection lost');
+        }
+      },
+    );
+
+    _startIceRecovery();
+    _startNetworkPolling();
+    _startReconnectRetryLoop();
+    // Try immediately — don't wait for first poll tick
+    unawaited(_tryReconnectWhenNetworkBack());
+  }
+
+  // Poll every 1s — detect network return quickly
+  void _startNetworkPolling() {
+    _networkPollTimer?.cancel();
+    _networkPollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!state.isReconnecting || _callTerminated) {
+        _networkPollTimer?.cancel();
+        return;
+      }
+      unawaited(_tryReconnectWhenNetworkBack());
+    });
+  }
+
+  // Retry full SDP renegotiation every 5s until connected or timeout
+  void _startReconnectRetryLoop() {
+    _reconnectRetryTimer?.cancel();
+    _reconnectRetryTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!state.isReconnecting || _callTerminated) {
+        _reconnectRetryTimer?.cancel();
+        return;
+      }
+      _log('Reconnect retry tick');
+      unawaited(_tryReconnectWhenNetworkBack());
+    });
+  }
+
+  Future<void> _tryReconnectWhenNetworkBack() async {
+    if (!state.isReconnecting || _callTerminated || _reconnectAttemptInFlight) {
+      return;
+    }
+    if (!await _hasLocalNetwork()) {
+      _log('Reconnect attempt skipped: network still down');
+      return;
+    }
+    if (_reconnectOfferSent && _lastAppliedReconnectAnswerSdp == null) {
+      final waitingSince = _lastReconnectOfferAt;
+      final waitingTooLong = waitingSince != null &&
+          DateTime.now().difference(waitingSince) > const Duration(seconds: 8);
+      if (waitingTooLong) {
+        _log('No reconnect answer yet, resending offer');
+        _reconnectOfferSent = false;
+      } else {
+        _log('Reconnect offer already sent, waiting for answer');
+        return;
+      }
+    }
+
+    _reconnectAttemptInFlight = true;
+    try {
+      _log('Network restored, trying SDP reconnect');
+      await _webrtc.reestablish();
+      emit(state.copyWith(hasRemoteVideo: _webrtc.remoteStream != null));
+
+      final offer = await _webrtc.createReconnectOffer();
+      _reconnectOfferSent = true;
+      _lastReconnectOfferAt = DateTime.now();
+      _log('Reconnect offer id=${_lastReconnectOfferAt!.millisecondsSinceEpoch}');
+      _lastAppliedReconnectAnswerSdp = null;
+
+      await _signallingRepo.sendReconnectOffer(
+        callId: _callId!,
+        fromUserId: _localUserId,
+        offer: offer,
+      );
+      _log('Reconnect offer sent');
+    } catch (e) {
+      _reconnectOfferSent = false;
+      _log('Reconnect attempt failed: $e');
+    } finally {
+      _reconnectAttemptInFlight = false;
+    }
+  }
+
+  Future<void> _handlePeerReconnectOffer(Map<String, dynamic> offer) async {
+    if (_callTerminated) return;
+    final now = DateTime.now();
+    final offerSdp = offer['sdp'] as String? ?? '';
+    final lastAt = _lastHandledReconnectOfferAt;
+    final isSameOffer = offerSdp.isNotEmpty && offerSdp == _lastHandledReconnectOfferSdp;
+    final inCooldown =
+        lastAt != null && now.difference(lastAt) < const Duration(seconds: 3);
+    if (isSameOffer || inCooldown) {
+      _log('Reconnect offer ignored (duplicate/cooldown)');
+      return;
+    }
+
+    try {
+      _log('Received peer reconnect offer');
+      _lastHandledReconnectOfferSdp = offerSdp;
+      _lastHandledReconnectOfferAt = now;
+      await _webrtc.reestablish();
+      _handledIceIds.clear();
+      await _webrtc.setRemoteDescription(offer);
+      final answer = await _webrtc.createAnswer();
+      await _signallingRepo.sendReconnectAnswer(
+        callId: _callId!,
+        answer: answer,
+      );
+      _log('Reconnect answer sent');
+      emit(state.copyWith(hasRemoteVideo: _webrtc.remoteStream != null));
+    } catch (e) {
+      _lastHandledReconnectOfferSdp = null;
+      _log('Failed handling peer reconnect offer: $e');
+    }
+  }
+
+  Future<void> _applyReconnectAnswer(Map<String, dynamic> answer) async {
+    if (_callTerminated) return;
+    try {
+      await _webrtc.setRemoteDescription(answer);
+      _log('answerApplied -> resume');
+      if (state.isReconnecting) {
+        _onReconnected();
+      }
+    } catch (e) {
+      _lastAppliedReconnectAnswerSdp = null;
+      _log('Failed applying reconnect answer: $e');
+    }
+  }
+
+  Future<void> _handleReconnectSignalling(CallDocumentModel doc) async {
+    if (_callTerminated) return;
+
+    final offer = doc.reconnectOffer;
+    if (offer != null &&
+        doc.reconnectFrom != null &&
+        doc.reconnectFrom != _localUserId) {
+      final offerSdp = offer['sdp'] as String? ?? '';
+      if (offerSdp.isNotEmpty) {
+        await _handlePeerReconnectOffer(offer);
+      }
+    }
+
+    final answer = doc.reconnectAnswer;
+    if (answer != null && _reconnectOfferSent) {
+      final answerSdp = answer['sdp'] as String? ?? '';
+      if (answerSdp.isNotEmpty &&
+          answerSdp != _lastAppliedReconnectAnswerSdp) {
+        _lastAppliedReconnectAnswerSdp = answerSdp;
+        await _applyReconnectAnswer(answer);
+      }
     }
   }
 
@@ -202,51 +582,12 @@ class CallCubit extends BaseCubit<CallUiState> {
     await _cleanup();
   }
 
-  // 30s grace window + ICE recovery — only when network drops, not on hang-up
-  Future<void> _enterReconnecting() async {
-    if (!_connected || state.isReconnecting || _callTerminated) return;
-
-    // Peer may have ended call — check Firestore before showing reconnect banner
-    final callId = _callId;
-    if (callId != null) {
-      try {
-        final doc = await _signallingRepo.getCall(callId);
-        if (doc != null &&
-            (doc.status == 'ended' || doc.status == 'declined')) {
-          await _handleRemoteCallEnd(doc.status);
-          return;
-        }
-      } catch (_) {
-        // Firestore unreachable — treat as network loss and try reconnect
-      }
-    }
-
-    if (_callTerminated || !_connected) return;
-
-    emit(state.copyWith(
-      isReconnecting: true,
-      statusMessage: 'Reconnecting…',
-    ));
-
-    _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(
-      const Duration(seconds: AppConstants.callReconnectGraceSeconds),
-      () {
-        if (state.isReconnecting && !_callTerminated) {
-          _failConnection('Connection lost');
-        }
-      },
-    );
-
-    _startIceRecovery();
-  }
-
-  // Retry ICE while waiting — helps auto-reconnect when data is turned back on
+  // Retry ICE every 3s while reconnecting or waiting for peer
   void _startIceRecovery() {
     _iceRecoveryTimer?.cancel();
     _attemptIceRecovery();
-    _iceRecoveryTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (!state.isReconnecting) {
+    _iceRecoveryTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (!state.isReconnecting && !_waitingForPeer) {
         _iceRecoveryTimer?.cancel();
         return;
       }
@@ -255,6 +596,11 @@ class CallCubit extends BaseCubit<CallUiState> {
   }
 
   Future<void> _attemptIceRecovery() async {
+    // When local network is back, start SDP renegotiation immediately
+    if (state.isReconnecting && await _hasLocalNetwork()) {
+      await _tryReconnectWhenNetworkBack();
+      return;
+    }
     try {
       await _webrtc.restartIce();
     } catch (_) {
@@ -262,19 +608,38 @@ class CallCubit extends BaseCubit<CallUiState> {
     }
   }
 
-  // Network restored within 30s — resume call UI and timer
+  // Network restored — resume call on device that lost connection
   void _onReconnected() {
+    _ignoreDisconnectUntil = DateTime.now().add(const Duration(seconds: 4));
     _reconnectTimer?.cancel();
     _iceRecoveryTimer?.cancel();
-    if (_callId != null) {
-      _signallingRepo.updateCallStatus(_callId!, 'connected');
-    }
+    _reconnectRetryTimer?.cancel();
+    _networkPollTimer?.cancel();
+    _clearReconnectSession();
+    _log('Call resumed after local reconnect');
     emit(state.copyWith(
       isReconnecting: false,
+      isPeerReconnecting: false,
       statusMessage: 'Connected',
       call: state.call?.copyWith(status: CallStatus.connected),
     ));
-    // Resume duration if timer was stopped during disconnect
+    if (_durationTimer == null || !(_durationTimer?.isActive ?? false)) {
+      _startDurationTimer();
+    }
+  }
+
+  // Peer came back — resume call on user who still had network
+  void _onPeerCameBack() {
+    _waitingForPeer = false;
+    _peerWaitTimer?.cancel();
+    _iceRecoveryTimer?.cancel();
+    _clearReconnectSession();
+    _log('Call resumed after peer reconnect');
+    emit(state.copyWith(
+      isPeerReconnecting: false,
+      statusMessage: 'Connected',
+      call: state.call?.copyWith(status: CallStatus.connected),
+    ));
     if (_durationTimer == null || !(_durationTimer?.isActive ?? false)) {
       _startDurationTimer();
     }
@@ -282,6 +647,7 @@ class CallCubit extends BaseCubit<CallUiState> {
 
   void _failConnection(String message) {
     if (_callTerminated) return;
+    _log('Failing call: $message');
     _callTerminated = true;
     _connected = false;
     _cancelReconnect();
@@ -323,6 +689,23 @@ class CallCubit extends BaseCubit<CallUiState> {
         return;
       }
 
+      // SDP renegotiation while peer reconnects after network loss
+      if (doc.reconnectOffer != null || doc.reconnectAnswer != null) {
+        await _handleReconnectSignalling(doc);
+      }
+
+      // Fallback resume path: if Firestore already reached connected,
+      // clear reconnect UI even when WebRTC callback is delayed.
+      if (doc.status == 'connected') {
+        if (state.isReconnecting) {
+          _log('Firestore connected -> local reconnect resolved');
+          _onReconnected();
+        } else if (state.isPeerReconnecting || _waitingForPeer) {
+          _log('Firestore connected -> peer reconnect resolved');
+          _onPeerCameBack();
+        }
+      }
+
       // Callee accepted — move caller from ringing to connecting
       if (doc.status == 'connecting' &&
           state.call?.status == CallStatus.ringing) {
@@ -346,13 +729,21 @@ class CallCubit extends BaseCubit<CallUiState> {
           '${candidate.candidate}_${candidate.sdpMid}_${candidate.sdpMLineIndex}';
       if (_handledIceIds.contains(key)) return;
       _handledIceIds.add(key);
-      await _webrtc.addIceCandidate(candidate);
+      try {
+        await _webrtc.addIceCandidate(candidate);
+        _log('[ICE] applied');
+      } catch (e) {
+        // Ignore transient ICE races while peer connection is rebuilding.
+        _log('[ICE] apply failed: $e');
+      }
     });
   }
 
   void _onConnected() {
     if (_connected) return;
     _connected = true;
+    _ignoreDisconnectUntil = DateTime.now().add(const Duration(seconds: 4));
+    _log('WebRTC connected');
     _ringTimeout?.cancel();
     _offlineCheckTimer?.cancel();
     _signallingRepo.updateCallStatus(_callId!, 'connected');
@@ -455,8 +846,12 @@ class CallCubit extends BaseCubit<CallUiState> {
     _cancelReconnect();
     _ringTimeout?.cancel();
     _offlineCheckTimer?.cancel();
+    _disconnectDebounceTimer?.cancel();
     _reconnectTimer?.cancel();
     _iceRecoveryTimer?.cancel();
+    _peerWaitTimer?.cancel();
+    _networkPollTimer?.cancel();
+    _reconnectRetryTimer?.cancel();
     _durationTimer?.cancel();
     await _callSub?.cancel();
     await _iceSub?.cancel();

@@ -54,5 +54,25 @@ class SignallingRepository extends BaseRepository {
   Future<void> updateCallStatus(String callId, String status) =>
       _service.updateCallStatus(callId, status);
 
+  Future<void> sendReconnectOffer({
+    required String callId,
+    required String fromUserId,
+    required Map<String, dynamic> offer,
+  }) =>
+      _service.sendReconnectOffer(
+        callId: callId,
+        fromUserId: fromUserId,
+        offer: offer,
+      );
+
+  Future<void> sendReconnectAnswer({
+    required String callId,
+    required Map<String, dynamic> answer,
+  }) =>
+      _service.sendReconnectAnswer(callId: callId, answer: answer);
+
+  Future<void> markCallConnected(String callId) =>
+      _service.markCallConnected(callId);
+
   Future<CallDocumentModel?> getCall(String callId) => _service.getCall(callId);
 }

@@ -63,6 +63,40 @@ class FirestoreSignallingService {
     await _calls.doc(callId).update({'status': status});
   }
 
+  // User who lost network sends new SDP when data returns
+  Future<void> sendReconnectOffer({
+    required String callId,
+    required String fromUserId,
+    required Map<String, dynamic> offer,
+  }) async {
+    await _calls.doc(callId).update({
+      'status': 'reconnecting',
+      'reconnectFrom': fromUserId,
+      'reconnectOffer': offer,
+      'reconnectAnswer': FieldValue.delete(),
+    });
+  }
+
+  Future<void> sendReconnectAnswer({
+    required String callId,
+    required Map<String, dynamic> answer,
+  }) async {
+    await _calls.doc(callId).update({
+      'reconnectAnswer': answer,
+      'status': 'reconnecting',
+    });
+  }
+
+  // Clear reconnect fields after call resumes
+  Future<void> markCallConnected(String callId) async {
+    await _calls.doc(callId).update({
+      'status': 'connected',
+      'reconnectFrom': FieldValue.delete(),
+      'reconnectOffer': FieldValue.delete(),
+      'reconnectAnswer': FieldValue.delete(),
+    });
+  }
+
   // One-shot read — used to detect remote hang-up before showing reconnect UI
   Future<CallDocumentModel?> getCall(String callId) async {
     final snap = await _calls.doc(callId).get();

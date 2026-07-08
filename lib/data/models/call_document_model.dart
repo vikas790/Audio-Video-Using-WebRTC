@@ -11,6 +11,9 @@ class CallDocumentModel {
     this.isVideo = false,
     this.offer,
     this.answer,
+    this.reconnectFrom,
+    this.reconnectOffer,
+    this.reconnectAnswer,
   });
 
   final String callId;
@@ -21,13 +24,19 @@ class CallDocumentModel {
   final bool isVideo;
   final Map<String, dynamic>? offer;
   final Map<String, dynamic>? answer;
+  final String? reconnectFrom;
+  final Map<String, dynamic>? reconnectOffer;
+  final Map<String, dynamic>? reconnectAnswer;
 
   CallStatus get callStatus => CallStatus.values.firstWhere(
         (e) => e.name == status,
         orElse: () => CallStatus.idle,
       );
 
-  factory CallDocumentModel.fromFirestore(String callId, Map<String, dynamic> data) {
+  factory CallDocumentModel.fromFirestore(
+    String callId,
+    Map<String, dynamic> data,
+  ) {
     return CallDocumentModel(
       callId: callId,
       callerId: data['callerId'] as String? ?? '',
@@ -37,6 +46,9 @@ class CallDocumentModel {
       isVideo: data['isVideo'] as bool? ?? false,
       offer: data['offer'] as Map<String, dynamic>?,
       answer: data['answer'] as Map<String, dynamic>?,
+      reconnectFrom: data['reconnectFrom'] as String?,
+      reconnectOffer: data['reconnectOffer'] as Map<String, dynamic>?,
+      reconnectAnswer: data['reconnectAnswer'] as Map<String, dynamic>?,
     );
   }
 }

@@ -13,6 +13,8 @@ class WebRTCService {
   RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
   MediaStream? _remoteStream;
+  bool _audio = true;
+  bool _video = false;
 
   void Function(RTCIceCandidate candidate)? onIceCandidate;
   void Function(RTCPeerConnectionState state)? onConnectionStateChange;
@@ -22,9 +24,48 @@ class WebRTCService {
   MediaStream? get remoteStream => _remoteStream;
 
   Future<void> init({required bool audio, bool video = false}) async {
-    _localStream = await navigator.mediaDevices.getUserMedia({
-      'audio': audio,
-      'video': video
+    _audio = audio;
+    _video = video;
+    _localStream = await _captureMedia();
+    _peerConnection = await createPeerConnection(_iceServers);
+    _bindPeerConnectionEvents();
+
+    for (final track in _localStream!.getTracks()) {
+      await _peerConnection!.addTrack(track, _localStream!);
+    }
+  }
+
+  // Rebuild peer connection after network drop (Android may kill tracks)
+  Future<void> reestablish({bool force = false}) async {
+    final state = _peerConnection?.connectionState;
+    final needsNewPc = force ||
+        _peerConnection == null ||
+        state == RTCPeerConnectionState.RTCPeerConnectionStateClosed ||
+        state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+        state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected;
+
+    if (!needsNewPc) return;
+
+    await _peerConnection?.close();
+    _peerConnection = null;
+
+    // Android releases camera/mic on failed state — always re-capture
+    _localStream?.getTracks().forEach((t) => t.stop());
+    await _localStream?.dispose();
+    _localStream = await _captureMedia();
+
+    _peerConnection = await createPeerConnection(_iceServers);
+    _bindPeerConnectionEvents();
+
+    for (final track in _localStream!.getTracks()) {
+      await _peerConnection!.addTrack(track, _localStream!);
+    }
+  }
+
+  Future<MediaStream> _captureMedia() async {
+    return navigator.mediaDevices.getUserMedia({
+      'audio': _audio,
+      'video': _video
           ? {
               'facingMode': 'user',
               'width': {'ideal': 640},
@@ -32,13 +73,9 @@ class WebRTCService {
             }
           : false,
     });
+  }
 
-    _peerConnection = await createPeerConnection(_iceServers);
-
-    for (final track in _localStream!.getTracks()) {
-      await _peerConnection!.addTrack(track, _localStream!);
-    }
-
+  void _bindPeerConnectionEvents() {
     _peerConnection!.onIceCandidate = (candidate) {
       if (candidate.candidate != null && candidate.candidate!.isNotEmpty) {
         onIceCandidate?.call(candidate);
@@ -63,6 +100,13 @@ class WebRTCService {
     return {'sdp': offer.sdp, 'type': offer.type};
   }
 
+  // ICE restart offer for mid-call network recovery
+  Future<Map<String, dynamic>> createReconnectOffer() async {
+    final offer = await _peerConnection!.createOffer({'iceRestart': true});
+    await _peerConnection!.setLocalDescription(offer);
+    return {'sdp': offer.sdp, 'type': offer.type};
+  }
+
   Future<Map<String, dynamic>> createAnswer() async {
     final answer = await _peerConnection!.createAnswer();
     await _peerConnection!.setLocalDescription(answer);
@@ -79,7 +123,13 @@ class WebRTCService {
 
   Future<void> addIceCandidate(SignallingMessageModel candidate) async {
     if (candidate.candidate == null || candidate.candidate!.isEmpty) return;
-    await _peerConnection!.addCandidate(
+    final pc = _peerConnection;
+    if (pc == null) {
+      // ICE can arrive while peer connection is rebuilding after reconnect.
+      // Ignored intentionally to prevent null-crash loop.
+      return;
+    }
+    await pc.addCandidate(
       RTCIceCandidate(
         candidate.candidate,
         candidate.sdpMid,
@@ -106,7 +156,6 @@ class WebRTCService {
     await Helper.switchCamera(tracks.first);
   }
 
-  // Trigger ICE restart when network returns mid-call
   Future<void> restartIce() async {
     await _peerConnection?.restartIce();
   }

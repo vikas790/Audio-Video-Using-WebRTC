@@ -228,7 +228,7 @@ class _CallViewState extends State<_CallView> {
                       _CallControls(isVideoCall: widget.isVideoCall),
                     ],
                   ),
-                  // Network drop — visible reconnect banner
+                  // Show banner only when this device loses network
                   if (state.isReconnecting)
                     const Positioned(
                       top: 0,
@@ -291,7 +291,7 @@ class _AudioCallBody extends StatelessWidget {
             Text(
               statusText,
               style: TextStyle(
-                color: _statusColor(state.call?.status),
+                color: _statusColorForState(state),
                 fontSize: 22,
                 fontWeight: FontWeight.w500,
               ),
@@ -308,6 +308,13 @@ class _AudioCallBody extends StatelessWidget {
       ),
     );
   }
+}
+
+Color _statusColorForState(CallUiState state) {
+  if (state.isReconnecting || state.isPeerReconnecting) {
+    return const Color(0xFF8A8A8A);
+  }
+  return _statusColor(state.call?.status);
 }
 
 Color _statusColor(CallStatus? status) {
@@ -425,7 +432,7 @@ class _VideoCallBody extends StatelessWidget {
               Text(
                 statusText,
                 style: TextStyle(
-                  color: _statusColor(state.call?.status).withValues(alpha: 0.9),
+                  color: _statusColorForState(state).withValues(alpha: 0.9),
                   fontSize: 14,
                   fontWeight: FontWeight.w500,
                 ),
@@ -499,7 +506,7 @@ class _VideoWaitingContent extends StatelessWidget {
         Text(
           statusText,
           style: TextStyle(
-            color: _statusColor(state.call?.status).withValues(alpha: 0.9),
+            color: _statusColorForState(state).withValues(alpha: 0.9),
             fontSize: 18,
             fontWeight: FontWeight.w500,
           ),
@@ -520,57 +527,61 @@ class _CallControls extends StatelessWidget {
       builder: (context, state) {
         final cubit = context.read<CallCubit>();
         final videoTheme = isVideoCall;
-        return Container(
-          color: videoTheme
-              ? Colors.black87
-              : const Color(AppConstants.appBackgroundValue),
-          padding: const EdgeInsets.all(16),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              IconButton(
-                onPressed: cubit.toggleMute,
-                icon: Icon(
-                  state.isMuted ? Icons.mic_off : Icons.mic,
-                  color: videoTheme
-                      ? Colors.white
-                      : const Color(0xFF2B2B2B),
-                ),
-              ),
-              if (isVideoCall) ...[
+        return SafeArea(
+          top: false,
+          // Keep controls above Android system navigation buttons.
+          child: Container(
+            color: videoTheme
+                ? Colors.black87
+                : const Color(AppConstants.appBackgroundValue),
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
                 IconButton(
-                  onPressed: cubit.toggleCamera,
+                  onPressed: cubit.toggleMute,
                   icon: Icon(
-                    state.isCameraOn ? Icons.videocam : Icons.videocam_off,
+                    state.isMuted ? Icons.mic_off : Icons.mic,
+                    color: videoTheme
+                        ? Colors.white
+                        : const Color(0xFF2B2B2B),
+                  ),
+                ),
+                if (isVideoCall) ...[
+                  IconButton(
+                    onPressed: cubit.toggleCamera,
+                    icon: Icon(
+                      state.isCameraOn ? Icons.videocam : Icons.videocam_off,
+                      color: videoTheme
+                          ? Colors.white
+                          : const Color(0xFF2B2B2B),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: cubit.switchCamera,
+                    icon: Icon(
+                      Icons.cameraswitch,
+                      color: videoTheme
+                          ? Colors.white
+                          : const Color(0xFF2B2B2B),
+                    ),
+                  ),
+                ],
+                IconButton(
+                  onPressed: cubit.toggleSpeaker,
+                  icon: Icon(
+                    state.isSpeakerOn ? Icons.volume_up : Icons.volume_off,
                     color: videoTheme
                         ? Colors.white
                         : const Color(0xFF2B2B2B),
                   ),
                 ),
                 IconButton(
-                  onPressed: cubit.switchCamera,
-                  icon: Icon(
-                    Icons.cameraswitch,
-                    color: videoTheme
-                        ? Colors.white
-                        : const Color(0xFF2B2B2B),
-                  ),
+                  onPressed: () => cubit.endCall(),
+                  icon: const Icon(Icons.call_end, color: Colors.red),
                 ),
               ],
-              IconButton(
-                onPressed: cubit.toggleSpeaker,
-                icon: Icon(
-                  state.isSpeakerOn ? Icons.volume_up : Icons.volume_off,
-                  color: videoTheme
-                      ? Colors.white
-                      : const Color(0xFF2B2B2B),
-                ),
-              ),
-              IconButton(
-                onPressed: () => cubit.endCall(),
-                icon: const Icon(Icons.call_end, color: Colors.red),
-              ),
-            ],
+            ),
           ),
         );
       },

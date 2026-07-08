@@ -204,7 +204,26 @@ class _UserRow extends StatelessWidget {
       ),
       child: Row(
         children: [
-          const DefaultCallerAvatar(size: 48),
+          Stack(
+            clipBehavior: Clip.none,
+            children: [
+              const DefaultCallerAvatar(size: 48),
+              // Online indicator pinned on avatar corner.
+              Positioned(
+                top: -1,
+                left: -1,
+                child: Container(
+                  width: 12,
+                  height: 12,
+                  decoration: BoxDecoration(
+                    color: user.isOnline ? Colors.green : Colors.grey,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white, width: 1.5),
+                  ),
+                ),
+              ),
+            ],
+          ),
           const SizedBox(width: 12),
           Expanded(
             child: Text(
@@ -212,11 +231,6 @@ class _UserRow extends StatelessWidget {
               style: const TextStyle(fontSize: 16),
               overflow: TextOverflow.ellipsis,
             ),
-          ),
-          Icon(
-            Icons.circle,
-            size: 12,
-            color: user.isOnline ? Colors.green : Colors.grey,
           ),
           IconButton(
             tooltip: 'Audio call',

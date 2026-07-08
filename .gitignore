@@ -35,7 +35,7 @@ android/key.properties
 # iOS
 ios/Pods/
 ios/.symlinks/
-ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.framewor
 ios/Flutter/Flutter.podspec
 ios/Flutter/Generated.xcconfig
 ios/Flutter/ephemeral/
